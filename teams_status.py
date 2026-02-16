@@ -89,7 +89,8 @@ class TeamsStatus():
     canStopSharing = False
 
     subscribed_topics = []
-    control_availibility = []
+    control_availability = []
+    control_state_topics = {}
 
     @staticmethod
     def check_and_set(name, message, can_switch_off = True, can_switch_on = False, inverted_name = None):
@@ -120,8 +121,9 @@ class TeamsStatus():
 
     @staticmethod
     def disable_all_controls():
-        for i in TeamsStatus.control_availibility:
+        for i in TeamsStatus.control_availability:
             mqtt_client.publish(i, "offline", qos=2, retain=False)
+        mqtt_client.publish(f"homeassistant/binary_sensor/{DEVICE}-{SERVICE_NAME}", "online", qos=2, retain=False)
 
     @staticmethod
     def send_mqtt_state(name, value, can_switch_off, can_switch_on, availability):
@@ -130,6 +132,16 @@ class TeamsStatus():
         mqtt_client.publish(f"homeassistant/binary_sensor/{DEVICE}-{SERVICE_NAME}/{name}/state", "ON" if value else "OFF", qos=2, retain=False)
         mqtt_client.publish(f"homeassistant/{switch_or_button}/{DEVICE}-{SERVICE_NAME}/{name}/state", "ON" if value else "OFF", qos=2, retain=False)
         mqtt_client.publish(f"homeassistant/{switch_or_button}/{DEVICE}-{SERVICE_NAME}/{name}/availability", "online" if availability else "offline", qos=2, retain=False)
+
+    @staticmethod
+    def refresh_mqtt_state():
+        mqtt_client.publish(f"homeassistant/binary_sensor/{DEVICE}-{SERVICE_NAME}", "online", qos=2, retain=False)
+        for name in ICONS:
+            value = TeamsStatus.__dict__[name] and TeamsStatus.isinmeeting
+            if value is not None:
+                mqtt_client.publish(f"homeassistant/binary_sensor/{DEVICE}-{SERVICE_NAME}/{name}/state", "ON" if value else "OFF", qos=2, retain=False)
+                if name in TeamsStatus.control_state_topics:
+                    mqtt_client.publish(TeamsStatus.control_state_topics[name], "ON" if value else "OFF", qos=2, retain=False)
 
     @staticmethod
     def mqtt_subscribe(topic):
@@ -157,7 +169,7 @@ class TeamsStatus():
             "state_topic": f"homeassistant/binary_sensor/{DEVICE}-{SERVICE_NAME}/{name}/state",
         }
         binary_sensor_topic = f"homeassistant/binary_sensor/{DEVICE}-{SERVICE_NAME}/{name}/config"
-        mqtt_client.publish(binary_sensor_topic, json.dumps(binary_sensor_config), qos=2, retain=False)
+        mqtt_client.publish(binary_sensor_topic, json.dumps(binary_sensor_config), qos=2, retain=True)
         mqtt_client.publish(binary_sensor_config["state_topic"], state, qos=2, retain=False)
 
         switch_or_button = "switch" if can_switch_on else "button"
@@ -175,10 +187,11 @@ class TeamsStatus():
         }
         if can_switch_off:
             switch_or_button_topic = f"homeassistant/{switch_or_button}/{DEVICE}-{SERVICE_NAME}/{name}/config"
-            mqtt_client.publish(switch_or_button_topic, json.dumps(switch_or_button_config), qos=2, retain=False)
+            TeamsStatus.control_state_topics[name] = switch_or_button_config["state_topic"]
+            mqtt_client.publish(switch_or_button_topic, json.dumps(switch_or_button_config), qos=2, retain=True)
 
-        if switch_or_button_config["availability_topic"] not in TeamsStatus.control_availibility:
-            TeamsStatus.control_availibility.append(switch_or_button_config["availability_topic"])
+        if switch_or_button_config["availability_topic"] not in TeamsStatus.control_availability:
+            TeamsStatus.control_availability.append(switch_or_button_config["availability_topic"])
 
         TeamsStatus.mqtt_subscribe(switch_or_button_config["command_topic"])
 
@@ -193,10 +206,11 @@ class TeamsStatus():
             "device": MQTT_DEVICE,
             "name": "Init Connection",
             "command_topic": f"homeassistant/button/{DEVICE}-{SERVICE_NAME}/init-connection/cmnd",
+            "availability_topic": f"homeassistant/binary_sensor/{DEVICE}-{SERVICE_NAME}",
             "optimistic": False,
         }
         button_topic = f"homeassistant/button/{DEVICE}-{SERVICE_NAME}/init-connection/config"
-        mqtt_client.publish(button_topic, json.dumps(button_config), qos=2, retain=False)
+        mqtt_client.publish(button_topic, json.dumps(button_config), qos=2, retain=True)
         TeamsStatus.mqtt_subscribe(button_config["command_topic"])
 
         TeamsStatus.send_mqtt_config('isinmeeting')
@@ -281,6 +295,10 @@ def ws_send_command(cmnd, params = None):
         ws.send(f'{{"requestId":{ws_send_command.requestId},"apiVersion":"2.0.0","action":"{cmnd}"}}')
 
 def on_mqtt_message(client, userdata, message, tmp=None):
+    if message.topic == "homeassistant/status":
+        TeamsStatus.refresh_mqtt_state()
+        return
+
     ha, domain, device, entity, cmnd = message.topic.split('/')
 
     command_maps = {
@@ -299,15 +317,16 @@ def on_mqtt_message(client, userdata, message, tmp=None):
     if domain == 'switch':
         key = f"{entity}/{message.payload.decode('ascii').lower()}"
 
+    if key == "init-connection":
+        TeamsStatus.refresh_mqtt_state()
+        ws_send_command("toggle-ui", {"type":"chat"})
+        time.sleep(1)
+
     if key in command_maps:
         if isinstance(command_maps[key], str):
             ws_send_command(command_maps[key])
         else:
             ws_send_command(*command_maps[key])
-
-    if key == "init-connection":
-        time.sleep(1)
-        ws_send_command("toggle-ui", {"type":"chat"})
 
 def on_mqtt_connect(client, userdata, flags, rc):
     print("mqtt (re)connected. Resubscribing to the topics.")
