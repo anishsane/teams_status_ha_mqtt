@@ -7,6 +7,7 @@ import json
 import keyring
 from getpass import getuser
 import paho.mqtt.client as mqtt
+import threading
 
 SERVICE_NAME = "teams_status"
 USER_NAME = getuser()
@@ -32,7 +33,6 @@ MQTT_DEVICE = {
 }
 
 try:
-    import sys
     if (sys.platform == "linux") and ('WSL' in open('/proc/version').read()):
         # MS windows can handle `keyring` via Windows credentials store.
         # Linux usually handles it via keyring manager like gnome-keyring-manager.
@@ -105,6 +105,8 @@ class TeamsStatus():
             new_val = new_val and TeamsStatus.isinmeeting
             if new_val == old_val: return
             print(name, TeamsStatus.__dict__[name], new_val)
+            if name == "isinmeeting":
+                TeamsStatus.refresh_mqtt_state()
 
             control_availability = TeamsStatus.isinmeeting and can_switch_off
 
@@ -355,6 +357,83 @@ def ws_run_till_interrupted():
     rel.signal(2, sys.exit)   # Keyboard Interrupt
     rel.signal(15, sys.exit)  # SIGTERM
     rel.dispatch()
+
+if sys.platform == "win32":
+    from pycaw.pycaw import AudioUtilities, IAudioMeterInformation, IAudioSessionControl2
+    from pycaw.callbacks import AudioSessionNotification
+    from pycaw.utils import AudioSession
+    TEAMS_EXE = 'ms-teams.exe'
+    class TeamsAudioSessionNotification(AudioSessionNotification):
+        def on_session_created(self, new_session):
+            try:
+                if new_session.Process.name().lower() != TEAMS_EXE:
+                    return
+            finally:
+                TeamsAudioMonitor.reinit()
+
+    class TeamsAudioMonitor():
+        ase = None
+        asm = None
+        ha_sensor_prefix = f"homeassistant/sensor/{DEVICE}-{SERVICE_NAME}/peakvolume"
+        indices = []
+
+        @staticmethod
+        def init():
+            TeamsAudioMonitor.asm = AudioUtilities.GetAudioSessionManager()
+            TeamsAudioMonitor.asm.RegisterSessionNotification(TeamsAudioSessionNotification())
+            TeamsAudioMonitor.init_mqtt()
+            TeamsAudioMonitor.reinit()
+
+        @staticmethod
+        def reinit():
+            TeamsAudioMonitor.ase = TeamsAudioMonitor.asm.GetSessionEnumerator()
+            is_teams_process = lambda process: process and process.name().lower() == TEAMS_EXE
+            get_audiosession_by_index = lambda i: AudioSession(TeamsAudioMonitor.ase.GetSession(i).QueryInterface(IAudioSessionControl2))
+            TeamsAudioMonitor.indices = [i for i in range(TeamsAudioMonitor.ase.GetCount()) if is_teams_process(get_audiosession_by_index(i).Process)]
+
+            # Teams starts 2 sessions, and one somehow captures system sounds as well. Below is a hack to weed it out.
+            TeamsAudioMonitor.indices = [i for i in TeamsAudioMonitor.indices if get_audiosession_by_index(i).Identifier.endswith('{00000000-0000-0000-0000-000000000000}')]
+
+        @staticmethod
+        def init_mqtt():
+            unique_id = f"{DEVICE}-{SERVICE_NAME}-peakvolume"
+            peak_volume_sensor_config = {
+                "icon": "mdi:volume-high",
+                "unique_id": f"{unique_id}",
+                "object_id": f"{unique_id}",
+                "default_entity_id": f"sensor.{unique_id}",
+                "device": MQTT_DEVICE,
+                "name": "Teams peak volume",
+                "state_class": "measurement",
+                "state_topic": f"{TeamsAudioMonitor.ha_sensor_prefix}/state",
+            }
+            peak_volume_sensor_topic = f"{TeamsAudioMonitor.ha_sensor_prefix}/config"
+            mqtt_client.publish(peak_volume_sensor_topic, json.dumps(peak_volume_sensor_config), qos=2, retain=True)
+            mqtt_client.publish(f"{TeamsAudioMonitor.ha_sensor_prefix}/state", 0, qos=2, retain=False)
+
+        @staticmethod
+        def update_mqtt(peakvolume):
+            mqtt_client.publish(f"{TeamsAudioMonitor.ha_sensor_prefix}/state", peakvolume, qos=2, retain=False)
+
+        @staticmethod
+        def run():
+            INTERVAL = 2 # Seconds
+            def try_get_peak_volume(index):
+                try:
+                    return TeamsAudioMonitor.ase.GetSession(index).QueryInterface(IAudioMeterInformation).GetPeakValue()
+                except:
+                    return 0
+            while True:
+                sesion_peak_volumes = [try_get_peak_volume(i) for i in TeamsAudioMonitor.indices]
+                TeamsAudioMonitor.update_mqtt(sum(sesion_peak_volumes) * 100)
+                time.sleep(INTERVAL)
+
+        @staticmethod
+        def start():
+            threading.Thread(target = TeamsAudioMonitor.run).start()
+
+    TeamsAudioMonitor.init()
+    TeamsAudioMonitor.start()
 
 while True:
     try:
